@@ -1,5 +1,6 @@
 package yuzu.emu.org
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.hardware.Sensor
 import android.hardware.SensorEvent
@@ -41,8 +42,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         DSUS_PadDataRsp(0x100002L)
     }
     data class ClientEndpoint(val ip: InetAddress, val port: Int, var timeout:Int)
-    data class Motion(val x: Float, val y: Float, var z:Float)
-    data class Touch(val id: Int,val x: Float, val y: Float, var p:Float)
+    data class Motion(var x: Float, var y: Float, var z:Float)
+    data class Touch(var id: Int,var x: Float, var y: Float, var p:Float)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -68,7 +69,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             val rand = Random().nextInt(10);
             serverTextView.text = rand.toString()
         }
-        //listenSocket = DatagramSocket(26760)
+        //Keep a socket open to listen to all the UDP trafic that is destined for this port
+        listenSocket = DatagramSocket(26760)
+        listenSocket.broadcast = true
+
         Thread(Runnable {
             while (true){
                 receiveUDP()
@@ -78,7 +82,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         Thread(Runnable {
             while (true){
                 sendControlerData()
-                Thread.sleep(10)
+                Thread.sleep(250)
             }
         }).start()
 
@@ -93,11 +97,13 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         return b;
     }
     fun longToByteArray(value: Long): ByteArray {
+        //println(value)
         var newvalue = value
         val b =  ByteArray(4)
         for (i in 0..3) {
             b[i]=newvalue.toByte()
             newvalue=newvalue shr 8
+            //println("b$i ${b[i]}")
         }
         return b;
     }
@@ -137,7 +143,12 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         currIdx += 2
         intToByteArray(packetBuffer.size-16).copyInto(packetBuffer,currIdx)
         currIdx += 2
+
         currIdx += 4 //crc
+
+        //clientid
+        intToByteArray(123).copyInto(packetBuffer,currIdx)
+        currIdx += 4
         return currIdx
     }
     fun getCRC(packetBuffer: ByteArray): Long {
@@ -152,20 +163,19 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
 
     fun SendPacket(packet:ByteArray, address: InetAddress, port: Int){
         try {
-            val socket = DatagramSocket()
-            socket.broadcast = true
             val sendData =  ByteArray(16+packet.size)
             var currIdx = BeginPacket(sendData,1001);
             packet.copyInto(sendData,currIdx)
             FinishPacket(sendData)
+            //println("Sending message size:${sendData.size}, device $address:$port")
             val sendPacket = DatagramPacket(sendData, sendData.size, address, port)
-            socket.send(sendPacket)
+            listenSocket.send(sendPacket)
 
         }catch (e: Exception) {}
     }
 
     fun IsPacketValid(packet:ByteArray):Boolean{
-        if(packet.size < 20){
+        if(packet.size < 16){
             println("Invalid header size ${packet.size}");
             return false;
         }
@@ -174,13 +184,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             println("Invalid magic value");
             return false
         }
-        println("ver")
         val protocol_version=byteArrayToInt(packet,4)
         if(protocol_version != 1001){
             println("Invalid protocol version $protocol_version");
             return false;
         }
-        println("lng")
         val payload_length=byteArrayToInt(packet,6)
         if(payload_length +16 >packet.size){
             println("Invalid package size $payload_length");
@@ -207,7 +215,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val connection = 3;
 
         var outIdx = 0
-        longToByteArray(MessageType.DSUS_PortInfo.value).copyInto(packet,8)
+        longToByteArray(MessageType.DSUS_PortInfo.value).copyInto(packet,0)
         outIdx += 4
 
         packet[outIdx++] = PadId.toByte()
@@ -254,8 +262,8 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 continue;
             }
 
-            val outputData = ByteArray(100)
-            var outIdx = BeginPacket(outputData, 1001)
+            val outputData = ByteArray(84)
+            var outIdx = 0
             longToByteArray(MessageType.DSUS_PadDataRsp.value).copyInto(outputData,outIdx)
             outIdx += 4
 
@@ -279,12 +287,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             longToByteArray(packetCounter).copyInto(outputData,outIdx)
             outIdx += 4;
 
-            if (!ReportToBuffer(outputData, outIdx))
-                return;
-            else
-                FinishPacket(outputData);
-
             SendPacket(outputData,client.ip,client.port)
+
+
         }
         packetCounter++
     }
@@ -345,20 +350,17 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         longToByteArray(gyro.z.toLong()).copyInto(outputData,outIdx)
         return true
     }
+
     open fun receiveUDP() {
         val buffer = ByteArray(1024)
-        var socket: DatagramSocket? = null
         try {
-            //Keep a socket open to listen to all the UDP trafic that is destined for this port
-            socket = DatagramSocket(26760)
-            socket.broadcast = true
             val packet = DatagramPacket(buffer, buffer.size)
-            socket.receive(packet)
+            listenSocket.receive(packet)
             if(!IsPacketValid(packet.data)){
                 println("invalid package")
                 return;
             }
-            println("valid package")
+            println("valid package from ${packet.socketAddress}:${packet.address}:${packet.port}")
             val payload_length=byteArrayToInt(packet.data,6)
             val id=byteArrayToLong(packet.data,12)
             val type=byteArrayToLong(packet.data,16)
@@ -373,6 +375,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     outIdx += 2
                     outputData[outIdx++] = 0
                     outputData[outIdx++] = 0
+
                     SendPacket(outputData,packet.address,packet.port)
                 }
                 MessageType.DSUC_ListPorts.value ->{
@@ -394,13 +397,14 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             println("open fun receiveUDP catch exception.$e")
             e.printStackTrace()
         } finally {
-            socket?.close()
+            //listenSocket?.close()
         }
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) {
     }
 
+    @SuppressLint("SetTextI18n")
     override fun onSensorChanged(event: SensorEvent?) {
         val GyroXTextView = findViewById<TextView>(R.id.txtGyroX)
         val GyroYTextView = findViewById<TextView>(R.id.txtGyroY)
@@ -410,14 +414,20 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         val AccZTextView = findViewById<TextView>(R.id.txtAccZ)
         when (event?.sensor?.type) {
             Sensor.TYPE_ACCELEROMETER -> {
-                AccXTextView.text = "X: " + event.values[0].toString()
-                AccYTextView.text = "Y: " + event.values[1].toString()
-                AccZTextView.text = "Z: " + event.values[2].toString()
+                gyro.x = event.values[0]
+                gyro.y = event.values[1]
+                gyro.z = event.values[2]
+                AccXTextView.text = "X: " + gyro.x.toString()
+                AccYTextView.text = "Y: " + gyro.y.toString()
+                AccZTextView.text = "Z: " + gyro.z.toString()
             }
             Sensor.TYPE_GYROSCOPE -> {
-                GyroXTextView.text = "X: " + event.values[0].toString()
-                GyroYTextView.text = "Y: " + event.values[1].toString()
-                GyroZTextView.text = "Z: " + event.values[2].toString()
+                accel.x = event.values[0]/9.8f
+                accel.y = event.values[1]/9.8f
+                accel.z = event.values[2]/9.8f
+                GyroXTextView.text = "X: " + accel.x.toString()
+                GyroYTextView.text = "Y: " + accel.y.toString()
+                GyroZTextView.text = "Z: " + accel.z.toString()
             }
             Sensor.TYPE_ROTATION_VECTOR -> {
 
